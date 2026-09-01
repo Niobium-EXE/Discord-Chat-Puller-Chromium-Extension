@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "Local Discord History Exporter",
+  "version": "0.6.9",
+  "description": "Exports Discord web chat history with offline media, Vencord deleted/edit detection, previous-export comparison, optional second-pass thread history with offline thread drawers, Opera/Opera GX sidebar support, MHTML and ZIP exports.",
+  "permissions": [
+    "activeTab",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://discord.com/*",
+    "https://cdn.discordapp.com/*",
+    "https://media.discordapp.net/*",
+    "https://images-ext-1.discordapp.net/*",
+    "https://images-ext-2.discordapp.net/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Export Discord history",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "sidebar_action": {
+    "default_title": "Discord History Exporter",
+    "default_panel": "sidebar.html",
+    "default_icon": {
+      "19": "icons/icon19.png",
+      "38": "icons/icon38.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://discord.com/channels/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
