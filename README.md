@@ -1,3 +1,17 @@
+## v0.7.1 startup bottom-anchor fix
+
+- Fixes a startup race where Discord's virtual message list could be nudged upward while the exporter was trying to move to the newest messages.
+- The exporter no longer calls `scrollIntoView()` on a potentially stale last-message node or sends a synthetic End key during bottom anchoring.
+- Jump-to-present now reacquires Discord's message scroller, pins it to the real bottom across multiple layout frames, and verifies the jump control is gone before scanning upward.
+- The main scan reacquires the virtual scroller as Discord recycles it and re-pins once after avatar/profile hydration so the first history step starts from the actual newest messages.
+
+## v0.7.0 verified thread return + large attachment fix
+
+- Thread exports still use the optional two-pass workflow, but the second pass now records the newest main-channel message ID from pass one, repeatedly returns Discord to the bottom, and verifies that newest ID is visible before thread scanning begins. If Discord cannot be returned to the newest messages, the exporter stops with a clear error instead of silently scanning threads from the wrong point.
+- The return-to-newest routine also tries Discord's visible **Jump to Present** control when available and waits for the virtualized message list to settle.
+- Large attachment embedding no longer sends an entire MP4 or other file through one Chromium extension message. Media is fetched by the background worker and transferred to the content script in 6 MiB chunks, avoiding Chromium's approximately 64 MiB extension-message limit.
+- Chunked transfer is used for both MHTML media embedding and ZIP media packing.
+
 ## v0.6.9 second-pass threads + thread drawer exports
 
 - **Include threads** remains an Advanced option and remains **off by default**.

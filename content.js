@@ -1527,16 +1527,135 @@
     });
   }
 
+  function newestVisibleMessageId(nodes) {
+    const ids = (nodes || []).map(messageIdFromNode).filter(Boolean);
+    if (!ids.length) return '';
+    return ids.reduce((newest, id) => {
+      try { return BigInt(id) > BigInt(newest) ? id : newest; }
+      catch (_) { return String(id) > String(newest) ? id : newest; }
+    });
+  }
+
+  function messageIdAtLeast(id, target) {
+    if (!id || !target) return false;
+    try { return BigInt(id) >= BigInt(target); }
+    catch (_) { return String(id) >= String(target); }
+  }
+
+  function findJumpToPresentControl() {
+    const controls = [...document.querySelectorAll('button,[role="button"]')];
+    for (const el of controls) {
+      if (!isVisibleElement(el)) continue;
+      const marker = [el.getAttribute('aria-label'), el.getAttribute('title'), el.textContent]
+        .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+      if (/jump to present|jump to bottom|go to present/i.test(marker)) return el;
+    }
+    return null;
+  }
+
+  function clickJumpToPresentControl() {
+    const el = findJumpToPresentControl();
+    if (!el) return false;
+    try { el.click(); return true; } catch (_) { return false; }
+  }
+
+  function forceScrollerToBottom(scroller) {
+    if (!scroller) return;
+    // Avoid scrollIntoView() and synthetic End keypresses here. Discord's virtual
+    // message list can recycle the old last message after Jump to Present, and
+    // scrolling that stale node into view nudges the chat upward again.
+    const bottom = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    try { scroller.scrollTo({ top: bottom, behavior: 'auto' }); } catch (_) {}
+    scroller.scrollTop = bottom;
+    // scrollHeight can change on the next layout frame as Discord loads/recycles
+    // rows, so setting it to scrollHeight as well keeps the viewport pinned.
+    scroller.scrollTop = scroller.scrollHeight;
+  }
+
+  async function pinMainScrollerToBottom(mainChannelId, existingScroller, settleMs = 120) {
+    let scroller = existingScroller;
+    const passes = 4;
+    for (let i = 0; i < passes; i++) {
+      const nodes = visibleMessageNodes(mainChannelId);
+      scroller = findScroller(nodes) || scroller;
+      if (!scroller) break;
+      forceScrollerToBottom(scroller);
+      // Two animation frames let Discord finish virtual-list layout before the
+      // next bottom pin, preventing the small startup jump seen in some clients.
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      forceScrollerToBottom(scroller);
+      if (settleMs > 0) await sleep(Math.max(20, Math.floor(settleMs / passes)));
+    }
+    return scroller;
+  }
+
+  async function moveMainScrollerToNewest(mainChannelId, existingScroller, delayMs, targetNewestId = '') {
+    let scroller = existingScroller;
+    let stable = 0;
+    let lastNewest = '';
+    const waitMs = Math.max(250, Number(delayMs) || 900);
+
+    for (let attempt = 1; attempt <= 18; attempt++) {
+      let nodes = visibleMessageNodes(mainChannelId);
+      scroller = findScroller(nodes) || scroller;
+      if (!scroller) throw new Error('Could not identify Discord\'s main message scroller while returning to the newest messages.');
+
+      const jumped = clickJumpToPresentControl();
+      // Jump to Present can replace/recycle the virtual list asynchronously. Give
+      // it a moment, reacquire the scroller, then pin the *new* list to bottom.
+      if (jumped) await sleep(Math.min(180, Math.max(60, Math.floor(waitMs / 4))));
+      nodes = visibleMessageNodes(mainChannelId);
+      scroller = findScroller(nodes) || scroller;
+      scroller = await pinMainScrollerToBottom(mainChannelId, scroller, Math.min(180, waitMs));
+
+      await sleep(waitMs);
+      nodes = visibleMessageNodes(mainChannelId);
+      scroller = findScroller(nodes) || scroller;
+      if (!scroller) throw new Error('Discord replaced the message scroller while returning to the newest messages.');
+
+      // One final pin after the wait handles rows/media that changed height while
+      // the list was settling. This is intentionally done before verification.
+      forceScrollerToBottom(scroller);
+      await new Promise(resolve => requestAnimationFrame(resolve));
+
+      nodes = visibleMessageNodes(mainChannelId);
+      scroller = findScroller(nodes) || scroller;
+      const newest = newestVisibleMessageId(nodes);
+      const bottomGap = Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop);
+      const targetReached = targetNewestId ? messageIdAtLeast(newest, targetNewestId) : true;
+      const atBottom = bottomGap <= 8;
+      const jumpStillVisible = !!findJumpToPresentControl();
+
+      if (atBottom && targetReached && !jumpStillVisible && newest && newest === lastNewest) stable++;
+      else stable = 0;
+      lastNewest = newest || lastNewest;
+
+      sendProgress(`Returning to newest messages…\npass ${attempt}\n${targetNewestId ? (targetReached ? 'newest message reached' : 'still loading newer messages') : (atBottom && !jumpStillVisible ? 'settling at newest messages' : 'moving down')}`);
+
+      if (atBottom && targetReached && !jumpStillVisible && stable >= 1) {
+        // Leave Discord positively pinned at bottom. The caller can now take its
+        // first snapshot without the startup code itself pulling the viewport up.
+        scroller = await pinMainScrollerToBottom(mainChannelId, scroller, 100);
+        return { scroller, newestMessageId: newest, verified: true };
+      }
+    }
+
+    // Do not silently scan from the wrong place. This function is used both at
+    // startup and before the thread pass, so an explicit failure is safer.
+    throw new Error('Could not return Discord to the newest messages automatically. Try clicking Jump to Present, then run the export again.');
+  }
+
   async function scanThreadsSecondPass(mainChannelId, mainScroller, threadMessages, attemptedKeys, avatarCache, avatarAttempts, options, completedThreadIds) {
     const { delayMs = 900, stagnantLimit = 8, stopAtMessageId = '' } = options || {};
     let scroller = mainScroller;
     if (!scroller) return { reachedBeginning: false, scroller: null };
 
     phase = 'threads';
-    sendProgress(`Main channel scan complete.\nStarting thread-only second pass…\n${threadMessages.size} thread replies captured`);
+    sendProgress(`Main channel scan complete.\nReturning to newest messages for the thread-only second pass…\n${threadMessages.size} thread replies captured`);
 
-    scroller.scrollTop = scroller.scrollHeight;
-    await sleep(delayMs);
+    const newestReturn = await moveMainScrollerToNewest(mainChannelId, scroller, delayMs, options?.targetNewestId || '');
+    scroller = newestReturn.scroller || scroller;
+    sendProgress(`Newest messages reached.\nStarting thread-only second pass…\n${threadMessages.size} thread replies captured`);
 
     let pass = 0;
     let stagnant = 0;
@@ -2932,9 +3051,9 @@ ${Math.round(totalBytes / 1024 / 1024)} MB fetched, ${failures} failed`);
           bytes = inline.bytes;
           contentType = inline.contentType;
         } else {
-          const result = await runtimeMessage({ type: 'DHE_FETCH_MEDIA', url: entry.url });
-          if (!result?.ok || !result.base64) throw new Error(result?.error || 'fetch failed');
-          bytes = base64ToBytes(result.base64);
+          const result = await fetchMediaChunkedBytes(entry.url);
+          if (!result?.ok || !result.bytes) throw new Error(result?.error || 'fetch failed');
+          bytes = result.bytes;
           contentType = result.contentType || contentType;
         }
         fetched.set(entry.key, { ...entry, bytes, contentType });
@@ -2956,6 +3075,60 @@ ${Math.round(totalBytes / 1024 / 1024)} MB fetched, ${failures} failed`);
 
   async function runtimeMessage(message) {
     return await chrome.runtime.sendMessage(message);
+  }
+
+  async function fetchMediaChunkedBase64(url) {
+    const start = await runtimeMessage({ type: 'DHE_FETCH_MEDIA_START', url });
+    if (!start?.ok || !start.token) throw new Error(start?.error || 'media fetch failed');
+    const token = start.token;
+    const chunkCount = Number(start.chunkCount) || 0;
+    const chunkSize = Number(start.chunkSize) || 0;
+    if (chunkCount < 1 && Number(start.byteLength) > 0) throw new Error('Media fetch returned no chunks.');
+    if (chunkSize && chunkSize % 3 !== 0) throw new Error('Media chunk size is not base64-concatenation safe.');
+    const parts = [];
+    try {
+      for (let i = 0; i < chunkCount; i++) {
+        const chunk = await runtimeMessage({ type: 'DHE_FETCH_MEDIA_CHUNK', token, index: i });
+        if (!chunk?.ok || typeof chunk.base64 !== 'string') throw new Error(chunk?.error || `media chunk ${i + 1} failed`);
+        parts.push(chunk.base64);
+      }
+      return {
+        ok: true,
+        contentType: start.contentType || 'application/octet-stream',
+        byteLength: Number(start.byteLength) || 0,
+        base64: parts.join('')
+      };
+    } finally {
+      try { await runtimeMessage({ type: 'DHE_FETCH_MEDIA_END', token }); } catch (_) {}
+    }
+  }
+
+  async function fetchMediaChunkedBytes(url) {
+    const start = await runtimeMessage({ type: 'DHE_FETCH_MEDIA_START', url });
+    if (!start?.ok || !start.token) throw new Error(start?.error || 'media fetch failed');
+    const token = start.token;
+    const chunkCount = Number(start.chunkCount) || 0;
+    const totalLength = Number(start.byteLength) || 0;
+    const output = new Uint8Array(totalLength);
+    let offset = 0;
+    try {
+      for (let i = 0; i < chunkCount; i++) {
+        const chunk = await runtimeMessage({ type: 'DHE_FETCH_MEDIA_CHUNK', token, index: i });
+        if (!chunk?.ok || typeof chunk.base64 !== 'string') throw new Error(chunk?.error || `media chunk ${i + 1} failed`);
+        const bytes = base64ToBytes(chunk.base64);
+        output.set(bytes, offset);
+        offset += bytes.length;
+      }
+      if (offset !== totalLength) throw new Error(`Media fetch was incomplete (${offset}/${totalLength} bytes).`);
+      return {
+        ok: true,
+        contentType: start.contentType || 'application/octet-stream',
+        byteLength: totalLength,
+        bytes: output
+      };
+    } finally {
+      try { await runtimeMessage({ type: 'DHE_FETCH_MEDIA_END', token }); } catch (_) {}
+    }
   }
 
   async function downloadMedia(entries, base) {
@@ -3005,8 +3178,8 @@ ${Math.round(totalBytes / 1024 / 1024)} MB fetched, ${failures} failed`);
         // so they need no separate MIME part.
         if (isInlineImageDataUrl(entry.url)) continue;
         try {
-          const result = await runtimeMessage({ type: 'DHE_FETCH_MEDIA', url: entry.url });
-          if (!result?.ok || !result.base64) throw new Error(result?.error || 'fetch failed');
+          const result = await fetchMediaChunkedBase64(entry.url);
+          if (!result?.ok || typeof result.base64 !== 'string') throw new Error(result?.error || 'fetch failed');
           fetched.set(entry.key, {
             ...entry,
             contentType: cleanHeaderValue(result.contentType || 'application/octet-stream'),
@@ -3105,12 +3278,23 @@ ${Math.round(totalBytes / 1024 / 1024)} MB fetched, ${failures} failed`);
 
       phase = 'scanning';
       sendProgress('Moving to the newest messages…');
-      scroller.scrollTop = scroller.scrollHeight;
-      await sleep(delayMs);
+      const initialNewest = await moveMainScrollerToNewest(mainChannelId, scroller, delayMs);
+      scroller = initialNewest.scroller || scroller;
       nodes = visibleMessageNodes(mainChannelId);
+      const mainNewestId = newestVisibleMessageId(nodes) || initialNewest.newestMessageId || '';
       scanInto(messages, avatarCache, nodes);
       await augmentVisibleStickerSnapshots(messages);
       await hydrateVisibleAvatars(messages, avatarCache, avatarAttempts, 6);
+
+      // Avatar/profile hydration can briefly open Discord UI that changes layout.
+      // Reacquire the virtual-list scroller and pin it to the newest messages one
+      // final time before the first upward history step. This prevents startup
+      // from beginning a few pixels/messages above the actual bottom.
+      nodes = visibleMessageNodes(mainChannelId);
+      scroller = findScroller(nodes) || scroller;
+      scroller = await pinMainScrollerToBottom(mainChannelId, scroller, 120);
+      nodes = visibleMessageNodes(mainChannelId);
+      scanInto(messages, avatarCache, nodes);
 
       let stagnant = 0;
       let pass = 0;
@@ -3120,6 +3304,11 @@ ${Math.round(totalBytes / 1024 / 1024)} MB fetched, ${failures} failed`);
       while (stagnant < stagnantLimit && !stopRequested) {
         pass++;
         nodes = visibleMessageNodes(mainChannelId);
+        scroller = findScroller(nodes) || scroller;
+        if (!scroller || !document.contains(scroller)) {
+          scroller = findScroller(nodes);
+          if (!scroller) throw new Error('Discord replaced the message scroller during the main history scan.');
+        }
         scanInto(messages, avatarCache, nodes);
         await augmentVisibleStickerSnapshots(messages);
         await hydrateVisibleAvatars(messages, avatarCache, avatarAttempts, 4);
@@ -3132,6 +3321,7 @@ ${Math.round(totalBytes / 1024 / 1024)} MB fetched, ${failures} failed`);
         await sleep(delayMs);
 
         nodes = visibleMessageNodes(mainChannelId);
+        scroller = findScroller(nodes) || scroller;
         const added = scanInto(messages, avatarCache, nodes);
         await augmentVisibleStickerSnapshots(messages);
         await hydrateVisibleAvatars(messages, avatarCache, avatarAttempts, 4);
@@ -3178,7 +3368,7 @@ ${Math.round(totalBytes / 1024 / 1024)} MB fetched, ${failures} failed`);
           attemptedThreadKeys,
           avatarCache,
           avatarAttempts,
-          { delayMs, stagnantLimit, stopAtMessageId: mainOldestId },
+          { delayMs, stagnantLimit, stopAtMessageId: mainOldestId, targetNewestId: mainNewestId },
           completedThreadIds
         );
         scroller = threadPass.scroller || scroller;

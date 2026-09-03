@@ -41,6 +41,17 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
+const MEDIA_CHUNK_BYTES = 6 * 1024 * 1024; // 6 MiB; divisible by 3 for safe base64 concatenation.
+const MEDIA_SESSION_TTL_MS = 5 * 60 * 1000;
+const mediaFetchSessions = new Map();
+
+function cleanupMediaFetchSessions() {
+  const cutoff = Date.now() - MEDIA_SESSION_TTL_MS;
+  for (const [token, session] of mediaFetchSessions) {
+    if ((session.lastAccess || session.createdAt || 0) < cutoff) mediaFetchSessions.delete(token);
+  }
+}
+
 async function fetchMedia(url) {
   if (!isAllowedMediaUrl(url)) throw new Error('Blocked non-Discord media URL.');
   const response = await fetch(url, { credentials: 'omit', redirect: 'follow' });
@@ -52,6 +63,53 @@ async function fetchMedia(url) {
     byteLength: buffer.byteLength,
     base64: arrayBufferToBase64(buffer)
   };
+}
+
+async function startMediaFetch(url) {
+  if (!isAllowedMediaUrl(url)) throw new Error('Blocked non-Discord media URL.');
+  cleanupMediaFetchSessions();
+  const response = await fetch(url, { credentials: 'omit', redirect: 'follow' });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const buffer = await response.arrayBuffer();
+  const token = crypto.randomUUID();
+  const now = Date.now();
+  mediaFetchSessions.set(token, {
+    buffer,
+    contentType: response.headers.get('content-type') || 'application/octet-stream',
+    createdAt: now,
+    lastAccess: now
+  });
+  return {
+    ok: true,
+    token,
+    contentType: response.headers.get('content-type') || 'application/octet-stream',
+    byteLength: buffer.byteLength,
+    chunkSize: MEDIA_CHUNK_BYTES,
+    chunkCount: Math.ceil(buffer.byteLength / MEDIA_CHUNK_BYTES)
+  };
+}
+
+function fetchMediaChunk(token, index) {
+  cleanupMediaFetchSessions();
+  const session = mediaFetchSessions.get(String(token || ''));
+  if (!session) throw new Error('Media fetch session expired.');
+  const i = Number(index);
+  if (!Number.isInteger(i) || i < 0) throw new Error('Invalid media chunk index.');
+  const start = i * MEDIA_CHUNK_BYTES;
+  if (start >= session.buffer.byteLength) throw new Error('Media chunk index is out of range.');
+  const end = Math.min(start + MEDIA_CHUNK_BYTES, session.buffer.byteLength);
+  session.lastAccess = Date.now();
+  return {
+    ok: true,
+    index: i,
+    byteLength: end - start,
+    base64: arrayBufferToBase64(session.buffer.slice(start, end))
+  };
+}
+
+function endMediaFetch(token) {
+  mediaFetchSessions.delete(String(token || ''));
+  return { ok: true };
 }
 
 async function downloadUrl(url, filename) {
@@ -83,7 +141,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'DHE_FETCH_MEDIA_START') {
+    startMediaFetch(message.url)
+      .then(sendResponse)
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
+  if (message?.type === 'DHE_FETCH_MEDIA_CHUNK') {
+    try { sendResponse(fetchMediaChunk(message.token, message.index)); }
+    catch (err) { sendResponse({ ok: false, error: err.message }); }
+    return false;
+  }
+
+  if (message?.type === 'DHE_FETCH_MEDIA_END') {
+    try { sendResponse(endMediaFetch(message.token)); }
+    catch (err) { sendResponse({ ok: false, error: err.message }); }
+    return false;
+  }
+
   if (message?.type === 'DHE_FETCH_MEDIA') {
+    // Kept for backward compatibility with already-loaded older content scripts.
     fetchMedia(message.url)
       .then(sendResponse)
       .catch(err => sendResponse({ ok: false, error: err.message }));

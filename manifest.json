@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Local Discord History Exporter",
-  "version": "0.6.9",
-  "description": "Exports Discord web chat history with offline media, Vencord deleted/edit detection, previous-export comparison, optional second-pass thread history with offline thread drawers, Opera/Opera GX sidebar support, MHTML and ZIP exports.",
+  "version": "0.7.1",
+  "description": "Exports Discord web chat history with offline media, chunked large-attachment embedding, Vencord deleted/edit detection, previous-export comparison, verified bottom anchoring, second-pass thread history with offline thread drawers, Opera/Opera GX sidebar support, MHTML and ZIP exports.",
   "permissions": [
     "activeTab",
     "downloads"
